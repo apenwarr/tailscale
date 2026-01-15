@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	authKey  = flag.String("authkey", "", "Tailscale auth key (required)")
-	stateDir = flag.String("statedir", "", "Base state directory (required)")
-	n        = flag.Int("n", 1, "Number of server instances")
+	centralAuthKey  = flag.String("central-authkey", "", "Auth key for central client instance (required)")
+	loadtestAuthKey = flag.String("loadtest-authkey", "", "Auth key for loadtest server instances (required)")
+	stateDir        = flag.String("statedir", "", "Base state directory (required)")
+	n               = flag.Int("n", 1, "Number of server instances")
 )
 
 func logf(format string, args ...any) {
@@ -33,8 +34,11 @@ func logf(format string, args ...any) {
 func main() {
 	flag.Parse()
 
-	if *authKey == "" {
-		log.Fatal("--authkey is required")
+	if *centralAuthKey == "" {
+		log.Fatal("--central-authkey is required")
+	}
+	if *loadtestAuthKey == "" {
+		log.Fatal("--loadtest-authkey is required")
 	}
 	if *stateDir == "" {
 		log.Fatal("--statedir is required")
@@ -56,7 +60,7 @@ func main() {
 		go func() {
 			srv := &tsnet.Server{
 				Hostname:  fmt.Sprintf("loadtest-server-%d", idx),
-				AuthKey:   *authKey,
+				AuthKey:   *loadtestAuthKey,
 				Ephemeral: true,
 				Dir:       filepath.Join(*stateDir, fmt.Sprintf("server-%d", idx)),
 			}
@@ -121,7 +125,7 @@ func main() {
 	// Create client instance
 	client := &tsnet.Server{
 		Hostname:  "loadtest-client",
-		AuthKey:   *authKey,
+		AuthKey:   *centralAuthKey,
 		Ephemeral: true,
 		Dir:       filepath.Join(*stateDir, "client"),
 	}
