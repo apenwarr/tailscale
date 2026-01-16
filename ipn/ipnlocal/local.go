@@ -5047,17 +5047,22 @@ func (b *LocalBackend) authReconfig() {
 	b.authReconfigLocked()
 }
 
+// ForceReconfig clears the engine's cached configuration state and forces
+// a full reconfiguration from the current netmap. This is used after
+// rehydrating the engine to ensure it gets the full configuration.
+func (b *LocalBackend) ForceReconfig() {
+	b.e.ClearConfigState()
+	b.authReconfig()
+}
+
 // authReconfigLocked is the locked version of [LocalBackend.authReconfig].
 //
 // b.mu must be held.
 func (b *LocalBackend) authReconfigLocked() {
-
 	if b.shutdownCalled {
-		b.logf("[v1] authReconfig: skipping because in shutdown")
 		return
 	}
 	if b.blocked {
-		b.logf("[v1] authReconfig: blocked, skipping.")
 		return
 	}
 
@@ -5065,7 +5070,6 @@ func (b *LocalBackend) authReconfigLocked() {
 
 	nm := cn.NetMap()
 	if nm == nil {
-		b.logf("[v1] authReconfig: netmap not yet valid. Skipping.")
 		return
 	}
 
@@ -5078,7 +5082,6 @@ func (b *LocalBackend) authReconfigLocked() {
 	b.reconfigAppConnectorLocked(nm, prefs)
 
 	if !prefs.WantRunning() {
-		b.logf("[v1] authReconfig: skipping because !WantRunning.")
 		return
 	}
 
@@ -5111,7 +5114,6 @@ func (b *LocalBackend) authReconfigLocked() {
 
 	cfg, err := nmcfg.WGCfg(priv, nm, b.logf, flags, prefs.ExitNodeID())
 	if err != nil {
-		b.logf("wgcfg: %v", err)
 		return
 	}
 
@@ -5122,7 +5124,6 @@ func (b *LocalBackend) authReconfigLocked() {
 	if err == wgengine.ErrNoChanges {
 		return
 	}
-	b.logf("[v1] authReconfig: ra=%v dns=%v 0x%02x: %v", prefs.RouteAll(), prefs.CorpDNS(), flags, err)
 
 	b.initPeerAPIListenerLocked()
 	if buildfeatures.HasAppConnectors {

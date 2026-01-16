@@ -76,11 +76,13 @@ func WGCfg(pk key.NodePrivate, nm *netmap.NetworkMap, logf logger.Logf, flags ne
 
 	var skippedExitNode, skippedSubnetRouter, skippedExpired []tailcfg.NodeView
 
+	var skippedNoDiscoNoDERP []tailcfg.NodeView
 	for _, peer := range nm.Peers {
 		if peer.DiscoKey().IsZero() && peer.HomeDERP() == 0 && !peer.IsWireGuardOnly() {
 			// Peer predates both DERP and active discovery, we cannot
 			// communicate with it.
 			logf("[v1] wgcfg: skipped peer %s, doesn't offer DERP or disco", peer.Key().ShortString())
+			skippedNoDiscoNoDERP = append(skippedNoDiscoNoDERP, peer)
 			continue
 		}
 		// Skip expired peers; we'll end up failing to connect to them
@@ -141,6 +143,7 @@ func WGCfg(pk key.NodePrivate, nm *netmap.NetworkMap, logf logger.Logf, flags ne
 	logList("skipped unselected exit nodes", skippedExitNode)
 	logList("did not accept subnet routes", skippedSubnetRouter)
 	logList("skipped expired peers", skippedExpired)
+	logList("skipped no disco/DERP", skippedNoDiscoNoDERP)
 
 	return cfg, nil
 }

@@ -528,7 +528,23 @@ func (s *Server) Rehydrate() error {
 	}
 
 	eng := s.sys.Engine.Get()
-	return eng.Rehydrate()
+	if err := eng.Rehydrate(); err != nil {
+		return err
+	}
+
+	// Force a full reconfiguration from the current netmap to ensure
+	// the new WireGuard device gets the complete configuration.
+	s.lb.ForceReconfig()
+
+	// Trigger a ReSTUN to refresh endpoint discovery after the new wireguard
+	// device is configured. This helps establish connectivity faster.
+	// Note: Rebind is now called inside engine.Rehydrate() before the wgdev
+	// is created, so we only need to trigger ReSTUN here.
+	if mc := s.sys.MagicSock.Get(); mc != nil {
+		mc.ReSTUN("rehydrate")
+	}
+
+	return nil
 }
 
 // IsDehydrated returns true if the server's WireGuard device is currently

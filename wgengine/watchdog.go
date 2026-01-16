@@ -191,3 +191,7 @@ func (e *watchdogEngine) Rehydrate() error {
 func (e *watchdogEngine) IsDehydrated() bool {
 	return e.wrap.IsDehydrated()
 }
+
+func (e *watchdogEngine) ClearConfigState() {
+	e.wrap.ClearConfigState()
+}

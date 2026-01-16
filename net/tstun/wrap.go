@@ -204,6 +204,17 @@ type Wrapper struct {
 	// disableTSMPRejected disables TSMP rejected responses. For tests.
 	disableTSMPRejected bool
 
+	// closeDisabled, when true, causes Close() to signal shutdown (closing
+	// channels) but not close the underlying TUN device. This is used during
+	// dehydration to allow wireguard-go's goroutines to exit while keeping
+	// the TUN device open for rehydration.
+	closeDisabled atomic.Bool
+
+	// shutdownMu protects shutdownCalled.
+	shutdownMu sync.Mutex
+	// shutdownCalled is true if signalShutdown has been called.
+	shutdownCalled bool
+
 	// connCounter maintains per-connection counters.
 	connCounter syncs.AtomicValue[netlogfunc.ConnectionCounter]
 
@@ -349,24 +360,97 @@ func (t *Wrapper) isSelfDisco(p *packet.Parsed) bool {
 }
 
 func (t *Wrapper) Close() error {
+	// If close is disabled (during dehydration), only signal shutdown
+	// without closing the underlying TUN device.
+	if t.closeDisabled.Load() {
+		t.signalShutdown()
+		return nil
+	}
 	var err error
 	t.closeOnce.Do(func() {
-		if t.started.CompareAndSwap(false, true) {
-			close(t.startCh)
-		}
-		close(t.closed)
-		t.bufferConsumedMu.Lock()
-		t.bufferConsumedClosed = true
-		close(t.bufferConsumed)
-		t.bufferConsumedMu.Unlock()
-		t.outboundMu.Lock()
-		t.outboundClosed = true
-		close(t.vectorOutbound)
-		t.outboundMu.Unlock()
+		t.signalShutdown()
 		err = t.tdev.Close()
 		t.eventClient.Close()
 	})
 	return err
+}
+
+// signalShutdown closes the wrapper's internal channels to unblock goroutines
+// without closing the underlying TUN device. This can be called multiple times
+// safely due to the atomic checks.
+func (t *Wrapper) signalShutdown() {
+	if t.started.CompareAndSwap(false, true) {
+		close(t.startCh)
+	}
+
+	t.shutdownMu.Lock()
+	defer t.shutdownMu.Unlock()
+
+	if t.shutdownCalled {
+		return
+	}
+	t.shutdownCalled = true
+
+	close(t.closed)
+	t.bufferConsumedMu.Lock()
+	t.bufferConsumedClosed = true
+	close(t.bufferConsumed)
+	t.bufferConsumedMu.Unlock()
+	t.outboundMu.Lock()
+	t.outboundClosed = true
+	close(t.vectorOutbound)
+	t.outboundMu.Unlock()
+}
+
+// SetCloseDisabled controls whether Close() closes the underlying TUN device.
+// When set to true, Close() will signal shutdown (closing channels to unblock
+// wireguard-go goroutines) but won't close the underlying TUN device.
+// This is used during dehydration.
+func (t *Wrapper) SetCloseDisabled(disabled bool) {
+	t.closeDisabled.Store(disabled)
+}
+
+// Restart reinitializes the wrapper's internal channels after a shutdown
+// (e.g., during rehydration). This allows the wrapper to be reused with
+// a new wireguard-go device. The underlying TUN device must still be open.
+// This method must only be called after signalShutdown() and before creating
+// a new wireguard-go device.
+func (t *Wrapper) Restart() {
+	t.shutdownMu.Lock()
+	defer t.shutdownMu.Unlock()
+
+	if !t.shutdownCalled {
+		return // Not shutdown, nothing to restart
+	}
+
+	// Reinitialize channels
+	t.closed = make(chan struct{})
+	t.bufferConsumedMu.Lock()
+	t.bufferConsumed = make(chan struct{}, 1)
+	t.bufferConsumedClosed = false
+	t.bufferConsumedMu.Unlock()
+	t.outboundMu.Lock()
+	t.vectorOutbound = make(chan tunVectorReadResult)
+	t.outboundClosed = false
+	t.outboundMu.Unlock()
+
+	// Recreate event channels (these were closed by pumpEvents when it exited)
+	t.eventsUpDown = make(chan tun.Event)
+	t.eventsOther = make(chan tun.Event)
+
+	// Reset started so the wrapper can be started again
+	t.started.Store(false)
+	t.startCh = make(chan struct{})
+
+	// Restart the background goroutines that handle reading from the TUN device
+	// and pumping events.
+	go t.pollVector()
+	go t.pumpEvents()
+
+	// The buffer starts out consumed (same as in Wrap/WrapTAP).
+	t.bufferConsumed <- struct{}{}
+
+	t.shutdownCalled = false
 }
 
 // isClosed reports whether t is closed.

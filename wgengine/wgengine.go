@@ -151,4 +151,10 @@ type Engine interface {
 
 	// IsDehydrated returns true if the engine is currently dehydrated.
 	IsDehydrated() bool
+
+	// ClearConfigState clears the engine's cached configuration state,
+	// forcing the next Reconfig call to apply the full configuration
+	// even if it appears unchanged. This is used after Rehydrate to ensure
+	// the new WireGuard device gets properly configured.
+	ClearConfigState()
 }

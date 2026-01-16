@@ -1733,3 +1733,156 @@ func TestResolveAuthKey(t *testing.T) {
 		})
 	}
 }
+
+// TestDehydrateRehydrate tests that a Server can be dehydrated and rehydrated
+// while maintaining connectivity.
+func TestDehydrateRehydrate(t *testing.T) {
+	tstest.Shard(t)
+	tstest.ResourceCheck(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	controlURL, _ := startControl(t)
+
+	// Start two servers
+	s1, s1ip, _ := startServer(t, ctx, controlURL, "s1")
+	s2, _, _ := startServer(t, ctx, controlURL, "s2")
+
+	// s1 listens on a port
+	ln, err := s1.Listen("tcp", ":8081")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	s1Conns := make(chan net.Conn, 10)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				// Listener might be closed during dehydration
+				return
+			}
+			select {
+			case s1Conns <- c:
+			case <-ctx.Done():
+				c.Close()
+			}
+		}
+	}()
+
+	// Test connectivity before dehydration
+	t.Log("Testing connectivity before dehydration...")
+	w, err := s2.Dial(ctx, "tcp", fmt.Sprintf("%s:8081", s1ip))
+	if err != nil {
+		t.Fatalf("s2.Dial before dehydrate failed: %v", err)
+	}
+	want := "hello-before"
+	if _, err := io.WriteString(w, want); err != nil {
+		t.Fatalf("Write before dehydrate failed: %v", err)
+	}
+	w.Close()
+
+	select {
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for connection before dehydration")
+	case r := <-s1Conns:
+		got := make([]byte, len(want))
+		_, err := io.ReadAtLeast(r, got, len(got))
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+	t.Log("Connectivity works before dehydration")
+
+	// Dehydrate s1
+	t.Log("Dehydrating s1...")
+	if err := s1.Dehydrate(); err != nil {
+		t.Fatalf("s1.Dehydrate failed: %v", err)
+	}
+	t.Log("s1 dehydrated")
+
+	// Verify s1 is dehydrated
+	if !s1.IsDehydrated() {
+		t.Error("s1 should be dehydrated")
+	}
+
+	// Create a new listener since the old one may have been affected
+	ln.Close()
+	ln2, err := s1.Listen("tcp", ":8082")
+	if err != nil {
+		t.Fatalf("s1.Listen while dehydrated failed: %v", err)
+	}
+	defer ln2.Close()
+
+	s1Conns2 := make(chan net.Conn, 10)
+	go func() {
+		for {
+			c, err := ln2.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				return
+			}
+			select {
+			case s1Conns2 <- c:
+			case <-ctx.Done():
+				c.Close()
+			}
+		}
+	}()
+
+	// Rehydrate s1
+	t.Log("Rehydrating s1...")
+	if err := s1.Rehydrate(); err != nil {
+		t.Fatalf("s1.Rehydrate failed: %v", err)
+	}
+	t.Log("s1 rehydrated")
+
+	// Verify s1 is no longer dehydrated
+	if s1.IsDehydrated() {
+		t.Error("s1 should not be dehydrated after rehydration")
+	}
+
+	// Test connectivity after rehydration
+	t.Log("Testing connectivity after rehydration...")
+
+	// Give some time for the WireGuard handshake to complete
+	time.Sleep(2 * time.Second)
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dialCancel()
+	w2, err := s2.Dial(dialCtx, "tcp", fmt.Sprintf("%s:8082", s1ip))
+	if err != nil {
+		t.Fatalf("s2.Dial after rehydrate failed: %v", err)
+	}
+	want2 := "hello-after"
+	if _, err := io.WriteString(w2, want2); err != nil {
+		t.Fatalf("Write after rehydrate failed: %v", err)
+	}
+	w2.Close()
+
+	select {
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for connection after rehydration")
+	case r := <-s1Conns2:
+		got := make([]byte, len(want2))
+		_, err := io.ReadAtLeast(r, got, len(got))
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want2 {
+			t.Errorf("got %q, want %q", got, want2)
+		}
+	}
+	t.Log("Connectivity works after rehydration")
+}

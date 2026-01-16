@@ -41,6 +41,9 @@ var (
 	servers   []*tsnet.Server
 )
 
+// Signal to rehydrate servers
+var rehydrateCh = make(chan struct{})
+
 func logf(format string, args ...any) {
 	now := time.Now().Format("2006-01-02 15:04:05.000")
 	log.Printf("[%s] "+format, append([]any{now}, args...)...)
@@ -70,15 +73,20 @@ func main() {
 	go func() {
 		logf("Starting pprof server on http://0.0.0.0:6060/debug/pprof/")
 		if err := http.ListenAndServe(":6060", nil); err != nil {
-			log.Fatalf("Failed to start pprof server: %v", err)
+			log.Printf("Failed to start pprof server (ignoring): %v", err)
 		}
 	}()
 
 	ctx := context.Background()
 
-	// Create n server instances
+	// Create n server instances and immediately dehydrate them after Up
 	serverAddrs := make([]string, *n)
 	servers = make([]*tsnet.Server, *n)
+	var serversUpWg sync.WaitGroup
+	serversUpWg.Add(*n)
+
+	logf("Waiting for all servers to be up and dehydrated...")
+
 	for i := 0; i < *n; i++ {
 		idx := i
 		go func() {
@@ -106,6 +114,25 @@ func main() {
 			serverAddrs[idx] = st.TailscaleIPs[0].String()
 			logf("Server %d up: %s", idx, serverAddrs[idx])
 
+			// Immediately dehydrate after Up
+			logf("Server %d dehydrating...", idx)
+			if err := srv.Dehydrate(); err != nil {
+				log.Fatalf("Server %d failed to dehydrate: %v", idx, err)
+			}
+			logf("Server %d dehydrated", idx)
+
+			serversUpWg.Done()
+
+			// Wait for signal to rehydrate
+			<-rehydrateCh
+
+			logf("Server %d rehydrating...", idx)
+			if err := srv.Rehydrate(); err != nil {
+				log.Fatalf("Server %d failed to rehydrate: %v", idx, err)
+			}
+			logf("Server %d rehydrated", idx)
+
+			// Now start listening
 			ln, err := srv.Listen("tcp", ":12345")
 			if err != nil {
 				log.Fatalf("Server %d failed to listen: %v", idx, err)
@@ -144,22 +171,9 @@ func main() {
 		}()
 	}
 
-	// Wait for all servers to be ready
-	logf("Waiting for all servers to be ready...")
-	for {
-		ready := true
-		for i := 0; i < *n; i++ {
-			if serverAddrs[i] == "" {
-				ready = false
-				break
-			}
-		}
-		if ready {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	logf("All servers ready")
+	// Wait for all servers to be up and dehydrated
+	serversUpWg.Wait()
+	logf("All %d servers are up and dehydrated", *n)
 
 	// Create client instance
 	client := &tsnet.Server{
@@ -180,7 +194,16 @@ func main() {
 	}
 	logf("Client up")
 
-	// Connect to each server and send data
+	// Signal servers to rehydrate FIRST
+	logf("Signaling all servers to rehydrate...")
+	close(rehydrateCh)
+
+	// Wait for servers to fully rehydrate before clients connect
+	logf("Waiting 3 seconds for servers to rehydrate...")
+	time.Sleep(3 * time.Second)
+
+	// Now spin up client connection goroutines AFTER servers are rehydrated
+	logf("Spinning up %d client connection goroutines...", *n)
 	for i := 0; i < *n; i++ {
 		idx := i
 		go func() {
@@ -210,6 +233,7 @@ func main() {
 			<-make(chan struct{})
 		}()
 	}
+	logf("All client connection goroutines started")
 
 	// Pause forever
 	logf("Setup complete, pausing forever")
@@ -217,11 +241,8 @@ func main() {
 }
 
 // doOneshotDehydrateTest performs the dehydration test for oneshot mode:
-// wait 5s, GC twice, save before.pprof, dehydrate all servers, GC twice, write pprof to stdout.
+// GC twice, save before.pprof, dehydrate all servers, GC twice, write pprof to stdout.
 func doOneshotDehydrateTest() {
-	// logf("Waiting 5 seconds before dehydration test...")
-	// time.Sleep(5 * time.Second)
-
 	logf("Running GC twice (before dehydrate)...")
 	runtime.GC()
 	runtime.GC()

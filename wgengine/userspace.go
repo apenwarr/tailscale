@@ -144,6 +144,7 @@ type userspaceEngine struct {
 	destIPActivityFuncs map[netip.Addr]func()
 	lastStatusPollTime  mono.Time    // last time we polled the engine status
 	reconfigureVPN      func() error // or nil
+	forceFullWGConfig   bool         // if true, skip lazy peer trimming on next reconfig
 
 	mu             sync.Mutex         // guards following; see lock order comment below
 	netMap         *netmap.NetworkMap // or nil
@@ -643,6 +644,13 @@ var debugTrimWireguard = envknob.RegisterOptBool("TS_DEBUG_TRIM_WIREGUARD")
 // stable!) but I'm worried that a future regression would be easier to debug
 // with these knobs in place.
 func (e *userspaceEngine) forceFullWireguardConfig(numPeers int) bool {
+	// If forceFullWGConfig is set (e.g., after rehydration), return true once
+	// and clear the flag.
+	if e.forceFullWGConfig {
+		e.logf("forceFullWireguardConfig: forceFullWGConfig flag is set, forcing full config")
+		e.forceFullWGConfig = false
+		return true
+	}
 	// Did the user explicitly enable trimming via the environment variable knob?
 	if b, ok := debugTrimWireguard().Get(); ok {
 		return !b
@@ -661,7 +669,13 @@ func (e *userspaceEngine) isTrimmablePeer(p *wgcfg.Peer, numPeers int) bool {
 	if e.forceFullWireguardConfig(numPeers) {
 		return false
 	}
+	return e.isTrimmablePeerNoForceCheck(p)
+}
 
+// isTrimmablePeerNoForceCheck is like isTrimmablePeer but doesn't check
+// forceFullWireguardConfig. Used when the force check is done once before
+// a loop over all peers.
+func (e *userspaceEngine) isTrimmablePeerNoForceCheck(p *wgcfg.Peer) bool {
 	// AllowedIPs must all be single IPs, not subnets.
 	for _, aip := range p.AllowedIPs {
 		if !aip.IsSingleIP() {
@@ -762,6 +776,11 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 		return nil
 	}
 
+	// If dehydrated, skip wireguard configuration - it will be applied on rehydrate.
+	if e.wgdev == nil {
+		return nil
+	}
+
 	full := e.lastCfgFull
 	e.wgLogger.SetPeers(full.Peers)
 
@@ -800,22 +819,39 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 		e.trimmedNodes = make(map[key.NodePublic]bool)
 	}
 
+	// Check forceFullWGConfig once before the loop so all peers are treated consistently
+	forceFullConfig := e.forceFullWireguardConfig(len(full.Peers))
+
 	needRemoveStep := false
 	for i := range full.Peers {
 		p := &full.Peers[i]
 		nk := p.PublicKey
-		if !buildfeatures.HasLazyWG || !e.isTrimmablePeer(p, len(full.Peers)) {
+		isTrimmable := buildfeatures.HasLazyWG && e.isTrimmablePeerNoForceCheck(p)
+
+		// Always track trimmable peers for activity, even when forceFullConfig is set.
+		// This ensures activity timestamps are preserved through reconfiguration.
+		if isTrimmable {
+			trackNodes = append(trackNodes, nk)
+			for _, cidr := range p.AllowedIPs {
+				trackIPs = append(trackIPs, cidr.Addr())
+			}
+		}
+
+		if !buildfeatures.HasLazyWG || forceFullConfig || !isTrimmable {
+			// Include unconditionally: lazy WG disabled, force full config, or non-trimmable peer
 			min.Peers = append(min.Peers, *p)
 			if discoChanged[nk] {
 				needRemoveStep = true
 			}
 			continue
 		}
-		trackNodes = append(trackNodes, nk)
+
+		// Trimmable peer with lazy WG enabled - check if recently active
 		recentlyActive := false
 		for _, cidr := range p.AllowedIPs {
-			trackIPs = append(trackIPs, cidr.Addr())
-			recentlyActive = recentlyActive || e.isActiveSinceLocked(nk, cidr.Addr(), activeCutoff)
+			ip := cidr.Addr()
+			active := e.isActiveSinceLocked(nk, ip, activeCutoff)
+			recentlyActive = recentlyActive || active
 		}
 		if recentlyActive {
 			min.Peers = append(min.Peers, *p)
@@ -828,12 +864,13 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 	}
 	e.lastNMinPeers = len(min.Peers)
 
-	if changed := checkchange.Update(&e.lastEngineInputs, &maybeReconfigInputs{
+	newInputs := &maybeReconfigInputs{
 		WGConfig:     &min,
 		TrimmedNodes: e.trimmedNodes,
 		TrackNodes:   views.SliceOf(trackNodes),
 		TrackIPs:     views.SliceOf(trackIPs),
-	}); !changed {
+	}
+	if changed := checkchange.Update(&e.lastEngineInputs, newInputs); !changed {
 		return nil
 	}
 
@@ -861,9 +898,7 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 		}
 	}
 
-	e.logf("wgengine: Reconfig: configuring userspace WireGuard config (with %d/%d peers)", len(min.Peers), len(full.Peers))
 	if err := wgcfg.ReconfigDevice(e.wgdev, &min, e.logf); err != nil {
-		e.logf("wgdev.Reconfig: %v", err)
 		return err
 	}
 	return nil
@@ -896,7 +931,7 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, 
 	oldFunc := e.destIPActivityFuncs
 	e.destIPActivityFuncs = make(map[netip.Addr]func(), len(oldFunc))
 
-	updateFn := func(timePtr *mono.Time) func() {
+	updateFn := func(timePtr *mono.Time, ip netip.Addr) func() {
 		return func() {
 			now := e.timeNow()
 			old := timePtr.LoadAtomic()
@@ -931,7 +966,7 @@ func (e *userspaceEngine) updateActivityMapsLocked(trackNodes []key.NodePublic, 
 
 		fn := oldFunc[ip]
 		if fn == nil {
-			fn = updateFn(timePtr)
+			fn = updateFn(timePtr, ip)
 		}
 		e.destIPActivityFuncs[ip] = fn
 	}
@@ -982,6 +1017,8 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	if dnsCfg == nil {
 		panic("dnsCfg must not be nil")
 	}
+
+	e.logf("Reconfig called: cfg has %d peers, lastEngineFull=%v", len(cfg.Peers), e.lastEngineFull != nil)
 
 	e.isLocalAddr.Store(ipset.NewContainsIPFunc(views.SliceOf(routerCfg.LocalAddrs)))
 
@@ -1087,9 +1124,12 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	e.magicConn.SetPreferredPort(listenPort)
 	e.magicConn.UpdatePMTUD()
 
+	e.logf("wgengine: Reconfig: calling maybeReconfigWireguardLocked with cfg.Peers=%d", len(cfg.Peers))
 	if err := e.maybeReconfigWireguardLocked(discoChanged); err != nil {
+		e.logf("wgengine: Reconfig: maybeReconfigWireguardLocked error: %v", err)
 		return err
 	}
+	e.logf("wgengine: Reconfig: maybeReconfigWireguardLocked done")
 
 	// Shutdown the network logger because the IDs changed.
 	// Let it be started back up by subsequent logic.
@@ -1843,16 +1883,22 @@ func (e *userspaceEngine) Dehydrate() error {
 	r := bufio.NewReader(strings.NewReader(""))
 	e.wgdev.IpcSetOperation(r)
 
+	// Disable TUN close so that wireguard-go's device.Close() doesn't close it.
+	// We want to reuse the TUN device when rehydrating.
+	e.tundev.SetCloseDisabled(true)
+
 	// Close the wireguard-go device. This frees all its goroutines and memory.
+	// The TUN device will NOT be closed because we disabled it above.
 	e.wgdev.Close()
 	e.wgdev = nil
 
-	e.logf("Dehydrate complete: WireGuard device closed")
+	e.logf("Dehydrate complete: WireGuard device closed (TUN preserved)")
 	return nil
 }
 
-// Rehydrate restores a dehydrated engine, recreating the WireGuard device
-// and reapplying the last configuration.
+// Rehydrate restores a dehydrated engine, recreating the WireGuard device.
+// The caller should call ClearConfigState followed by Reconfig to apply
+// the configuration to the new device.
 func (e *userspaceEngine) Rehydrate() error {
 	e.mu.Lock()
 	if e.closing {
@@ -1872,6 +1918,20 @@ func (e *userspaceEngine) Rehydrate() error {
 		return errors.New("engine not dehydrated")
 	}
 
+	e.logf("Rehydrating: restarting TUN wrapper and rebinding UDP sockets...")
+
+	// Restart the TUN wrapper to reinitialize its channels. During dehydration,
+	// Close() was called with closeDisabled=true, which closed the channels
+	// but not the underlying TUN device. We need to recreate the channels
+	// before the new wireguard device's goroutines try to use them.
+	e.tundev.Restart()
+
+	// Rebind the UDP sockets. During dehydration, wgdev.Close() called
+	// connBind.Close() which closed the underlying UDP sockets. We need to
+	// rebind them before the new wireguard device's receive goroutines try
+	// to use them.
+	e.magicConn.Rebind()
+
 	e.logf("Rehydrating: creating new WireGuard device...")
 
 	// Create a new wireguard-go device with the same tundev and magicConn
@@ -1884,21 +1944,21 @@ func (e *userspaceEngine) Rehydrate() error {
 		return fmt.Errorf("wgdev.Up: %w", err)
 	}
 
-	// Reapply the last configuration if we have one
-	if e.lastEngineFull != nil {
-		e.logf("Rehydrating: reapplying WireGuard config with %d peers...", len(e.lastEngineFull.Peers))
-		if err := wgcfg.ReconfigDevice(e.wgdev, e.lastEngineFull, e.logf); err != nil {
-			e.logf("Rehydrate: ReconfigDevice error: %v", err)
-			// Don't fail - the device is up, just without config
-		}
-	}
+	// Re-enable TUN close so that normal Close() will work properly.
+	e.tundev.SetCloseDisabled(false)
 
-	// Clear dehydrated flag
+	// Start the TUN wrapper so that wireguard-go's Read() goroutines can proceed.
+	// This was originally called during initial setup, but after Restart() the
+	// wrapper needs to be started again.
+	e.tundev.Start()
+
+	// Clear dehydrated flag. The caller is responsible for calling
+	// ClearConfigState and Reconfig to apply the configuration.
 	e.mu.Lock()
 	e.dehydrated = false
 	e.mu.Unlock()
 
-	e.logf("Rehydrate complete: WireGuard device restored")
+	e.logf("Rehydrate complete: WireGuard device restored (awaiting config)")
 	return nil
 }
 
@@ -1907,4 +1967,40 @@ func (e *userspaceEngine) IsDehydrated() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.dehydrated
+}
+
+// ClearConfigState clears the engine's cached configuration state,
+// forcing the next Reconfig call to apply the full configuration.
+// This also sets a flag to force full wireguard config (no lazy peer trimming)
+// on the next reconfig, which is important after rehydration.
+//
+// Additionally, this marks all currently tracked peers as "recently active"
+// so they won't be trimmed by lazy peer trimming immediately after rehydration.
+func (e *userspaceEngine) ClearConfigState() {
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+
+	e.logf("ClearConfigState: clearing lastEngineFull (was %d peers), lastRouter, lastDNSConfig, setting forceFullWGConfig=true",
+		len(e.lastCfgFull.Peers))
+	e.lastEngineFull = nil
+	e.lastEngineInputs = nil
+	e.lastRouter = nil
+	e.lastDNSConfig = dns.ConfigView{}
+	e.forceFullWGConfig = true
+
+	// Mark all currently tracked peers as recently active so they won't be
+	// immediately trimmed after rehydration. This is important because after
+	// rehydration, the activity timestamps may be stale, causing peers to be
+	// trimmed before they have a chance to exchange traffic.
+	now := e.timeNow()
+	for nk := range e.recvActivityAt {
+		e.recvActivityAt[nk] = now
+		e.logf("ClearConfigState: marking peer %s as recently active", nk.ShortString())
+	}
+	for ip, timePtr := range e.sentActivityAt {
+		if timePtr != nil {
+			timePtr.StoreAtomic(now)
+			e.logf("ClearConfigState: marking IP %v as recently active", ip)
+		}
+	}
 }
