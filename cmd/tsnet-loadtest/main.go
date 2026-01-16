@@ -12,8 +12,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
+	"sync/atomic"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -24,7 +28,10 @@ var (
 	loadtestAuthKey = flag.String("loadtest-authkey", "", "Auth key for loadtest server instances (required)")
 	stateDir        = flag.String("statedir", "", "Base state directory (required)")
 	n               = flag.Int("n", 1, "Number of server instances")
+	oneshot         = flag.Bool("oneshot", false, "Exit after all servers read 1 byte, dumping heap profile to stdout")
 )
+
+var serversReadCount atomic.Int32
 
 func logf(format string, args ...any) {
 	now := time.Now().Format("2006-01-02 15:04:05.000")
@@ -50,6 +57,14 @@ func main() {
 	if err := os.MkdirAll(*stateDir, 0700); err != nil {
 		log.Fatalf("Failed to create statedir: %v", err)
 	}
+
+	// Start pprof HTTP server
+	go func() {
+		logf("Starting pprof server on http://0.0.0.0:6060/debug/pprof/")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			log.Fatalf("Failed to start pprof server: %v", err)
+		}
+	}()
 
 	ctx := context.Background()
 
@@ -98,6 +113,19 @@ func main() {
 						return
 					}
 					logf("Server %d read 1 byte", idx)
+
+					// Track reads for oneshot mode
+					if *oneshot {
+						count := serversReadCount.Add(1)
+						if int(count) == *n {
+							logf("All %d servers have read 1 byte, dumping heap profile and exiting", *n)
+							if err := pprof.WriteHeapProfile(os.Stdout); err != nil {
+								log.Fatalf("Failed to write heap profile: %v", err)
+							}
+							os.Exit(0)
+						}
+					}
+
 					// Pause forever
 					<-make(chan struct{})
 				}(conn)
