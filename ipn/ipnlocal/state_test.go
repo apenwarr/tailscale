@@ -2019,6 +2019,12 @@ func (e *mockEngine) Done() <-chan struct{} {
 	return e.done
 }
 
+func (e *mockEngine) Dehydrate() error { return nil }
+
+func (e *mockEngine) Rehydrate() error { return nil }
+
+func (e *mockEngine) IsDehydrated() bool { return false }
+
 // hasValidNetMap returns true if the backend has a valid network map with a valid self node.
 func hasValidNetMap(b *LocalBackend) bool {
 	nm := b.NetMap()

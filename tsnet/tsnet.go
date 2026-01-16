@@ -493,6 +493,54 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// Dehydrate shuts down the WireGuard device to free goroutines and memory,
+// while maintaining the connection to DERP and the control server.
+// Call Rehydrate to restore the WireGuard device.
+// This is an experimental feature for memory optimization.
+func (s *Server) Dehydrate() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("tsnet: %w", net.ErrClosed)
+	}
+	s.mu.Unlock()
+
+	if s.lb == nil {
+		return errors.New("tsnet: server not started")
+	}
+
+	eng := s.sys.Engine.Get()
+	return eng.Dehydrate()
+}
+
+// Rehydrate restores the WireGuard device after a Dehydrate call.
+// This is an experimental feature for memory optimization.
+func (s *Server) Rehydrate() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("tsnet: %w", net.ErrClosed)
+	}
+	s.mu.Unlock()
+
+	if s.lb == nil {
+		return errors.New("tsnet: server not started")
+	}
+
+	eng := s.sys.Engine.Get()
+	return eng.Rehydrate()
+}
+
+// IsDehydrated returns true if the server's WireGuard device is currently
+// dehydrated.
+func (s *Server) IsDehydrated() bool {
+	if s.lb == nil {
+		return false
+	}
+	eng := s.sys.Engine.Get()
+	return eng.IsDehydrated()
+}
+
 func (s *Server) doInit() {
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 	if err := s.start(); err != nil {

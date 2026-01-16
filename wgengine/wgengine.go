@@ -137,4 +137,18 @@ type Engine interface {
 	// packets traversing the data path. The hook can be uninstalled by
 	// calling this function with a nil value.
 	InstallCaptureHook(packet.CaptureCallback)
+
+	// Dehydrate shuts down the WireGuard device to free goroutines and memory,
+	// while keeping the magicsock connection and other subsystems alive.
+	// The engine can be restored by calling Rehydrate.
+	// This is an experimental feature for memory optimization.
+	Dehydrate() error
+
+	// Rehydrate restores a dehydrated engine, recreating the WireGuard device
+	// and reapplying the last configuration.
+	// This is an experimental feature for memory optimization.
+	Rehydrate() error
+
+	// IsDehydrated returns true if the engine is currently dehydrated.
+	IsDehydrated() bool
 }

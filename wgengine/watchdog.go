@@ -179,3 +179,15 @@ func (e *watchdogEngine) InstallCaptureHook(cb packet.CaptureCallback) {
 func (e *watchdogEngine) PeerByKey(pubKey key.NodePublic) (_ wgint.Peer, ok bool) {
 	return e.wrap.PeerByKey(pubKey)
 }
+
+func (e *watchdogEngine) Dehydrate() error {
+	return e.watchdogErr("Dehydrate", func() error { return e.wrap.Dehydrate() })
+}
+
+func (e *watchdogEngine) Rehydrate() error {
+	return e.watchdogErr("Rehydrate", func() error { return e.wrap.Rehydrate() })
+}
+
+func (e *watchdogEngine) IsDehydrated() bool {
+	return e.wrap.IsDehydrated()
+}

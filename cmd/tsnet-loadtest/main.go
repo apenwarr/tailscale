@@ -16,7 +16,9 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +34,12 @@ var (
 )
 
 var serversReadCount atomic.Int32
+
+// Track all server instances for dehydration
+var (
+	serversMu sync.Mutex
+	servers   []*tsnet.Server
+)
 
 func logf(format string, args ...any) {
 	now := time.Now().Format("2006-01-02 15:04:05.000")
@@ -70,6 +78,7 @@ func main() {
 
 	// Create n server instances
 	serverAddrs := make([]string, *n)
+	servers = make([]*tsnet.Server, *n)
 	for i := 0; i < *n; i++ {
 		idx := i
 		go func() {
@@ -79,6 +88,11 @@ func main() {
 				Ephemeral: true,
 				Dir:       filepath.Join(*stateDir, fmt.Sprintf("server-%d", idx)),
 			}
+
+			// Track server for dehydration
+			serversMu.Lock()
+			servers[idx] = srv
+			serversMu.Unlock()
 
 			logf("Starting server instance %d", idx)
 			if err := srv.Start(); err != nil {
@@ -118,11 +132,8 @@ func main() {
 					if *oneshot {
 						count := serversReadCount.Add(1)
 						if int(count) == *n {
-							logf("All %d servers have read 1 byte, dumping heap profile and exiting", *n)
-							if err := pprof.WriteHeapProfile(os.Stdout); err != nil {
-								log.Fatalf("Failed to write heap profile: %v", err)
-							}
-							os.Exit(0)
+							logf("All %d servers have read 1 byte", *n)
+							doOneshotDehydrateTest()
 						}
 					}
 
@@ -203,4 +214,51 @@ func main() {
 	// Pause forever
 	logf("Setup complete, pausing forever")
 	<-make(chan struct{})
+}
+
+// doOneshotDehydrateTest performs the dehydration test for oneshot mode:
+// wait 5s, GC twice, save before.pprof, dehydrate all servers, GC twice, write pprof to stdout.
+func doOneshotDehydrateTest() {
+	// logf("Waiting 5 seconds before dehydration test...")
+	// time.Sleep(5 * time.Second)
+
+	logf("Running GC twice (before dehydrate)...")
+	runtime.GC()
+	runtime.GC()
+
+	logf("Writing heap profile to before.pprof...")
+	f, err := os.Create("before.pprof")
+	if err != nil {
+		log.Fatalf("Failed to create before.pprof: %v", err)
+	}
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		log.Fatalf("Failed to write before.pprof: %v", err)
+	}
+	f.Close()
+
+	logf("Dehydrating all %d server instances...", len(servers))
+	serversMu.Lock()
+	for i, srv := range servers {
+		if srv == nil {
+			continue
+		}
+		logf("Dehydrating server %d...", i)
+		if err := srv.Dehydrate(); err != nil {
+			log.Printf("Failed to dehydrate server %d: %v", i, err)
+		}
+	}
+	serversMu.Unlock()
+	logf("All servers dehydrated")
+
+	logf("Running GC twice (after dehydrate)...")
+	runtime.GC()
+	runtime.GC()
+
+	logf("Writing heap profile to stdout...")
+	if err := pprof.WriteHeapProfile(os.Stdout); err != nil {
+		log.Fatalf("Failed to write heap profile to stdout: %v", err)
+	}
+
+	logf("Dehydration test complete, exiting")
+	os.Exit(0)
 }

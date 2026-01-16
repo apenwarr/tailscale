@@ -148,6 +148,7 @@ type userspaceEngine struct {
 	mu             sync.Mutex         // guards following; see lock order comment below
 	netMap         *netmap.NetworkMap // or nil
 	closing        bool               // Close was called (even if we're still closing)
+	dehydrated     bool               // Dehydrate was called; wgdev is nil
 	statusCallback StatusCallback
 	peerSequence   views.Slice[key.NodePublic]
 	endpoints      []tailcfg.Endpoint
@@ -502,8 +503,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		case <-e.wgdev.Wait():
 			e.mu.Lock()
 			closing := e.closing
+			dehydrated := e.dehydrated
 			e.mu.Unlock()
-			if !closing {
+			if !closing && !dehydrated {
 				e.logf("Closing the engine because the WireGuard device has been closed...")
 				e.Close()
 			}
@@ -1321,15 +1323,23 @@ func (e *userspaceEngine) Close() {
 	e.closing = true
 	e.mu.Unlock()
 
-	r := bufio.NewReader(strings.NewReader(""))
-	e.wgdev.IpcSetOperation(r)
+	e.wgLock.Lock()
+	wgdev := e.wgdev
+	e.wgLock.Unlock()
+
+	if wgdev != nil {
+		r := bufio.NewReader(strings.NewReader(""))
+		wgdev.IpcSetOperation(r)
+	}
 	e.magicConn.Close()
 	if e.netMonOwned {
 		e.netMon.Close()
 	}
 	e.dns.Down()
 	e.router.Close()
-	e.wgdev.Close()
+	if wgdev != nil {
+		wgdev.Close()
+	}
 	e.tundev.Close()
 	if e.birdClient != nil {
 		e.birdClient.DisableProtocol("tailscale")
@@ -1800,4 +1810,101 @@ func (e *userspaceEngine) reconfigureVPNIfNecessary() error {
 		return nil
 	}
 	return e.reconfigureVPN()
+}
+
+// Dehydrate shuts down the WireGuard device to free goroutines and memory,
+// while keeping the magicsock connection and other subsystems alive.
+// The engine can be restored by calling Rehydrate.
+func (e *userspaceEngine) Dehydrate() error {
+	e.mu.Lock()
+	if e.closing {
+		e.mu.Unlock()
+		return errors.New("engine is closing")
+	}
+	if e.dehydrated {
+		e.mu.Unlock()
+		return errors.New("engine already dehydrated")
+	}
+	// Set dehydrated flag before closing wgdev so the watcher goroutine
+	// doesn't try to close the engine when wgdev.Wait() returns.
+	e.dehydrated = true
+	e.mu.Unlock()
+
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+
+	if e.wgdev == nil {
+		return errors.New("engine already dehydrated")
+	}
+
+	e.logf("Dehydrating: closing WireGuard device...")
+
+	// Clear the wgdev config first to disconnect all peers
+	r := bufio.NewReader(strings.NewReader(""))
+	e.wgdev.IpcSetOperation(r)
+
+	// Close the wireguard-go device. This frees all its goroutines and memory.
+	e.wgdev.Close()
+	e.wgdev = nil
+
+	e.logf("Dehydrate complete: WireGuard device closed")
+	return nil
+}
+
+// Rehydrate restores a dehydrated engine, recreating the WireGuard device
+// and reapplying the last configuration.
+func (e *userspaceEngine) Rehydrate() error {
+	e.mu.Lock()
+	if e.closing {
+		e.mu.Unlock()
+		return errors.New("engine is closing")
+	}
+	if !e.dehydrated {
+		e.mu.Unlock()
+		return errors.New("engine not dehydrated")
+	}
+	e.mu.Unlock()
+
+	e.wgLock.Lock()
+	defer e.wgLock.Unlock()
+
+	if e.wgdev != nil {
+		return errors.New("engine not dehydrated")
+	}
+
+	e.logf("Rehydrating: creating new WireGuard device...")
+
+	// Create a new wireguard-go device with the same tundev and magicConn
+	e.wgdev = wgcfg.NewDevice(e.tundev, e.magicConn.Bind(), e.wgLogger.DeviceLogger)
+
+	e.logf("Bringing WireGuard device up...")
+	if err := e.wgdev.Up(); err != nil {
+		e.wgdev.Close()
+		e.wgdev = nil
+		return fmt.Errorf("wgdev.Up: %w", err)
+	}
+
+	// Reapply the last configuration if we have one
+	if e.lastEngineFull != nil {
+		e.logf("Rehydrating: reapplying WireGuard config with %d peers...", len(e.lastEngineFull.Peers))
+		if err := wgcfg.ReconfigDevice(e.wgdev, e.lastEngineFull, e.logf); err != nil {
+			e.logf("Rehydrate: ReconfigDevice error: %v", err)
+			// Don't fail - the device is up, just without config
+		}
+	}
+
+	// Clear dehydrated flag
+	e.mu.Lock()
+	e.dehydrated = false
+	e.mu.Unlock()
+
+	e.logf("Rehydrate complete: WireGuard device restored")
+	return nil
+}
+
+// IsDehydrated returns true if the engine is currently dehydrated.
+func (e *userspaceEngine) IsDehydrated() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.dehydrated
 }
