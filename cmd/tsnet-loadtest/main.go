@@ -16,6 +16,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"sync/atomic"
 	"time"
@@ -118,7 +119,14 @@ func main() {
 					if *oneshot {
 						count := serversReadCount.Add(1)
 						if int(count) == *n {
-							logf("All %d servers have read 1 byte, dumping heap profile and exiting", *n)
+							logf("All %d servers have read 1 byte, sleeping 10s to drain queues", *n)
+							// Sleep to let all in-flight packets drain from queues
+							time.Sleep(10 * time.Second)
+							logf("Sleep complete, forcing GC and dumping heap profile", *n)
+							// Force GC to clean up unreachable buffers before profiling
+							runtime.GC()
+							runtime.GC() // Run twice to ensure cleanup
+							logf("GC complete, dumping heap profile")
 							if err := pprof.WriteHeapProfile(os.Stdout); err != nil {
 								log.Fatalf("Failed to write heap profile: %v", err)
 							}
@@ -169,9 +177,12 @@ func main() {
 	}
 	logf("Client up")
 
-	// Connect to each server and send data
+	// Connect to each server sequentially, one at a time
+	// Wait for server to read 1 byte before moving to next connection
 	for i := 0; i < *n; i++ {
 		idx := i
+
+		// Launch goroutine for this connection
 		go func() {
 			addr := net.JoinHostPort(serverAddrs[idx], "12345")
 			logf("Client connecting to server %d at %s", idx, addr)
@@ -198,6 +209,17 @@ func main() {
 			// Pause forever
 			<-make(chan struct{})
 		}()
+
+		// Wait for server to read the byte before starting next connection
+		// Poll the counter to see when this server has read
+		startCount := serversReadCount.Load()
+		for {
+			if serversReadCount.Load() > startCount {
+				logf("Server %d has read 1 byte, proceeding to next connection", idx)
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 
 	// Pause forever
